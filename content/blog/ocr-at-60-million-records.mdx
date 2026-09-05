@@ -1,0 +1,53 @@
+---
+title: "What I Learned Extracting 60 Million Records from Scanned Voter Rolls"
+description: "No single OCR engine wins on every document. Here's how an adaptive, multi-engine pipeline got us from unusable accuracy to 100K records in 90 minutes."
+date: "2026-06-18"
+tags: ["OCR", "Computer Vision", "Docker", "Tamil NLP"]
+---
+
+When people hear "OCR," they usually picture a clean PDF and `pytesseract.image_to_string()`. The reality of large-scale government document extraction looks nothing like that.
+
+Our task: extract structured fields from **60+ million scanned voter roll pages**, printed in Tamil, across decades of inconsistent scanners, print qualities, and layouts. Some pages were crisp. Many were skewed, faded, or photographed at an angle from a photocopier lid. A single OCR engine — no matter how good — was never going to hit acceptable accuracy across that entire distribution.
+
+## Why one engine wasn't enough
+
+Early on, we benchmarked three OCR engines against a labeled sample:
+
+- **Tesseract** — fast, reliable on clean, high-contrast scans, but brittle on Tamil ligatures under noise.
+- **Surya OCR** — strong on complex, multi-column layouts, but slower per page.
+- **PaddleOCR** — surprisingly resilient on low-contrast and slightly rotated scans.
+
+No engine dominated. Each had a "zone of competence" tied to specific document conditions. So instead of picking a winner, we built a system that picks the winner *per document*.
+
+## The preprocessing layer matters as much as the model
+
+Before any engine sees a page, it goes through an OpenCV preprocessing stage:
+
+```python
+def preprocess(image):
+    image = deskew(image)
+    image = denoise(image)
+    image = enhance_contrast(image)
+    return image
+```
+
+De-skewing alone recovered a meaningful chunk of accuracy on photocopied pages, where even a 2-3 degree tilt was enough to break character segmentation. Contrast enhancement helped the most on older scans where toner had faded unevenly across the page.
+
+## An adaptive OCR selection strategy
+
+Rather than running all three engines on every page (expensive, and unnecessary), we classify each document by a handful of cheap signals — estimated noise level, contrast variance, layout complexity — and route it to the engine most likely to perform well on that profile. Lower-confidence outputs get escalated to a second engine as a fallback pass.
+
+This is the part that actually moved the needle: it's not about having the best individual model, it's about knowing *when* to trust which model.
+
+## Making it fast: Docker microservices
+
+Accuracy was only half the problem. At 60 million records, even a small per-page latency compounds into days of processing time. We containerized each OCR engine as an independent microservice and ran them behind a job queue, allowing horizontal scaling and parallelized, distributed processing across the corpus.
+
+The result: extraction of 100,000 records dropped from what would have been well over half a day of naive processing to **90 minutes**.
+
+## What I'd tell someone starting a similar project
+
+1. Benchmark on your actual data distribution, not a clean sample — the edge cases *are* the dataset.
+2. Preprocessing is not optional. It's often cheaper to fix the image than to fix the model.
+3. Design for graceful degradation. A pipeline that fails loudly on 5% of documents is more useful than one that silently guesses.
+4. Optimize for parallelism early — a correct pipeline that can't scale is still an unsolved problem at production volume.

@@ -1,0 +1,51 @@
+---
+title: "Fine-Tuning Gemma 12B on Synthetic Data When You Have No Labeled Dataset"
+description: "We needed a domain-specific Q&A model and had zero instruction data to start from. Here's the synthetic-data pipeline that got us there."
+date: "2026-02-11"
+tags: ["LLM Fine-Tuning", "Gemma", "Synthetic Data", "FastAPI"]
+---
+
+The usual advice for fine-tuning is "get a good labeled dataset." Ours didn't exist. We had plenty of *structured* domain data — records, fields, relationships — but nothing in the instruction–response format a language model needs to learn from.
+
+So the first project wasn't fine-tuning at all. It was generating the dataset we needed to fine-tune on.
+
+## Generating instruction data from structured records
+
+We used GPT APIs to convert structured data into natural instruction–response pairs through careful prompt engineering — effectively asking a strong general-purpose model to imagine the questions a user might ask about a record, and write grounded answers using only the fields provided.
+
+A simplified version of the generation prompt:
+
+```
+Given the following structured record:
+{record}
+
+Generate 3 diverse, natural questions a user might ask about this record,
+and a concise, accurate answer to each — using only information present
+in the record. Vary question phrasing and difficulty.
+```
+
+The "using only information present in the record" constraint mattered enormously — without it, the generator model would happily hallucinate plausible-sounding but false elaborations, which would then get baked into the fine-tuning set as ground truth. That's a mistake you only catch by manually auditing samples, so we did — repeatedly, at each iteration of the prompt.
+
+## Validating before training, not after
+
+Before any fine-tuning run, every generated pair went through a validation pipeline that checked for:
+
+- **Groundedness** — does the answer only reference facts present in the source record?
+- **Duplication** — near-identical question phrasing across records, which would over-represent certain patterns.
+- **Length and format consistency** — wildly inconsistent answer lengths made early training runs unstable.
+
+Catching bad examples here was far cheaper than catching them after a multi-hour training run.
+
+## Fine-tuning Gemma 12B
+
+With a cleaned instruction dataset in hand, we fine-tuned an open-source **Gemma 12B** model for the domain Q&A task. The interesting part wasn't the training loop itself — it was benchmarking.
+
+We ran the same held-out question set through both the base model and the fine-tuned model, scoring on groundedness, correctness, and whether the answer actually used domain-specific terminology instead of generic hedging. The fine-tuned model's biggest win wasn't raw correctness — the base model was often *directionally* right — it was **precision and format consistency**: shorter, more directly useful answers that didn't need to be re-prompted or reformatted downstream.
+
+## Shipping it
+
+The fine-tuned model went behind a FastAPI inference service, which handles request batching and keeps a small in-memory cache for repeated queries — a detail that mattered more than expected once we saw real traffic patterns cluster around a long tail of similar questions.
+
+## The takeaway
+
+Fine-tuning is often framed as the hard part of a project like this. In practice, it was the most mechanical step. The real engineering effort — and the place bugs actually hid — was in the synthetic data generation and validation pipeline that came before it. If your training data is wrong, no amount of hyperparameter tuning fixes that afterward.

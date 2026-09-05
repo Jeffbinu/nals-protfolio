@@ -1,0 +1,52 @@
+---
+title: "Building a RAG System That Doesn't Care Where the Content Came From"
+description: "Newspapers, blogs, and social video all describe the same events differently. Here's how we unified them into one semantic search layer with Qdrant."
+date: "2026-04-02"
+tags: ["RAG", "Qdrant", "Embeddings", "FastAPI"]
+---
+
+A story rarely lives in one place. A political announcement might appear as a formatted newspaper column, a blog post with commentary, and a two-minute video clip on social media — each with different structure, different noise, and in our case, more than one language.
+
+The brief was simple to state and hard to build: let someone search across all of it, by meaning, from one endpoint.
+
+## Step one: getting everything into text
+
+Before any retrieval can happen, every source has to become clean, comparable text.
+
+- **Newspapers** — arrived as scanned images. We used a YOLO-based layout analysis model to detect individual article boundaries within a page, since a single scanned sheet often contains 6-8 unrelated articles that a naive OCR pass would run together.
+- **Blogs** — mostly clean HTML, but needed boilerplate stripping (nav bars, related-article widgets, ads) before embedding — otherwise the embeddings pick up more site chrome than content.
+- **Video** — we ran Tamil Whisper ASR over automatically segmented audio to produce timestamped transcripts, which let us later link a search result back to the exact moment in a video.
+
+## Choosing an embedding strategy
+
+We settled on OpenAI's `text-embedding-3-large` for the semantic layer, indexed in **Qdrant**. A few things mattered more than the embedding model choice itself:
+
+- **Chunking strategy** — naive fixed-length chunking split entities and dates across chunk boundaries constantly. We moved to a semantic chunker that respects paragraph and sentence boundaries, which noticeably improved retrieval precision on entity-heavy queries.
+- **Metadata as a first-class citizen** — every chunk carries source type, publish date, language, and original URL/timestamp. Filtering by metadata *before* the vector search dramatically cuts latency and irrelevant matches for queries like "coverage from the last week."
+
+## The retrieval API
+
+The FastAPI backend exposes a single search endpoint that does more than nearest-neighbor lookup:
+
+```python
+@app.post("/search")
+async def search(query: SearchQuery):
+    filters = build_metadata_filters(query)
+    hits = qdrant_client.search(
+        collection_name="news",
+        query_vector=embed(query.text),
+        query_filter=filters,
+        limit=query.top_k,
+    )
+    return rank_and_summarize(hits, query.text)
+```
+
+`rank_and_summarize` does a second pass: it takes the top vector matches and asks an LLM to generate a short, query-aware summary and a relevance justification, rather than just returning raw snippets. This turned out to matter a lot for user trust — people wanted to know *why* a result was surfaced, not just that it scored well numerically.
+
+## What surprised me
+
+The hardest bugs weren't in the vector search — they were in the boring glue code. A mismatched timezone in publish-date metadata silently broke "recent coverage" filtering for weeks before anyone noticed the pattern. The lesson: in a multi-source system, the unglamorous metadata pipeline deserves the same rigor as the embedding model.
+
+## Where this is headed
+
+The natural next step is incremental indexing — right now, new sources are batch-processed on a schedule. Moving to a streaming ingestion path would let search results reflect breaking coverage within minutes instead of hours.
